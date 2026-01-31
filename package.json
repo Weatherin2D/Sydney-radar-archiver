@@ -4,11 +4,14 @@
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "postinstall": "npx playwright install"
+    "postinstall": "npx playwright install --with-deps"
   },
   "dependencies": {
     "playwright": "^1.41.0",
     "node-fetch": "^3.3.2",
     "form-data": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
