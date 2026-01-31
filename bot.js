@@ -1,110 +1,74 @@
 const { chromium } = require("playwright");
-const browser = await chromium.launch({ headless: true });
-const fetch = (...args) =>
-import("node-fetch").then(({ default: fetch }) => fetch(...args));
+const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 const fs = require("fs");
 const FormData = require("form-data");
+const path = require("path");
 
-// ==============================
-// CONFIG
-// ==============================
-
-// Discord webhook
+// Discord webhook from environment variable
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
+if (!WEBHOOK_URL) throw new Error("WEBHOOK_URL is not set in environment variables");
 
-if (!WEBHOOK_URL) {
-  throw new Error("WEBHOOK_URL is not set");
-}
-
-// Folder to store screenshots temporarily
-const SCREENSHOT_DIR = "screenshots";
-
-// Element ID to screenshot (same on all sites)
-const ELEMENT_SELECTOR = "#content > table:nth-child(2) > tbody > tr > td > img"; // <-- change if needed
-
-// Websites to monitor
-const TARGETS = [
-{
-name: "Sydney_128KM",
-url: "https://reg.bom.gov.au/products/IDR713.shtml",
-},
-{
-name: "Sydney_64KM",
-url: "https://reg.bom.gov.au/products/IDR714.shtml",
-},
-{
-name: "Sydney_DOPPLER_128KM",
-url: "https://reg.bom.gov.au/products/IDR71I.shtml",
-},
+// Websites to screenshot
+const TARGET_URLS = [
+"https://reg.bom.gov.au/products/IDR713.shtml",
+"https://reg.bom.gov.au/products/IDR714.shtml",
+"https://reg.bom.gov.au/products/IDR71I.shtml"
 ];
 
-// ==============================
-// SETUP
-// ==============================
+// The ID of the element to screenshot
+const ELEMENT_ID = "map"; // change to your specific element ID
 
-// Ensure screenshot folder exists
-if (!fs.existsSync(SCREENSHOT_DIR)) {
-fs.mkdirSync(SCREENSHOT_DIR);
-}
+// Screenshot interval (6 minutes)
+const INTERVAL = 6 * 60 * 1000;
 
-// ==============================
-// MAIN FUNCTION
-// ==============================
 async function takeScreenshotsAndSend() {
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage();
 
-for (const target of TARGETS) {
+for (const url of TARGET_URLS) {
 try {
-await page.goto(target.url, { waitUntil: "networkidle" });
+await page.goto(url, { waitUntil: "networkidle" });
 
-// Optional zoom for clarity
-await page.evaluate(() => {
-document.body.style.zoom = "150%";
-});
+// Select the element
+const elementHandle = await page.$(`#${ELEMENT_ID}`);
+if (!elementHandle) {
+console.log(`❌ Element with ID "${ELEMENT_ID}" not found on ${url}`);
+continue;
+}
 
-// Wait for the specific element
-const element = await page.waitForSelector(ELEMENT_SELECTOR, {
-timeout: 15000,
-});
+// Get UTC timestamp for file name
+const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+const safeName = `${url.replace(/[^a-z0-9]/gi, '_').toLowerCase()}_${timestamp}.png`;
+const filePath = path.join(__dirname, safeName);
 
-// UTC timestamp
-const timestamp = new Date().toISOString().replace(/[:]/g, "-");
+// Screenshot the element
+await elementHandle.screenshot({ path: filePath });
 
-// Filename
-const filePath = `${SCREENSHOT_DIR}/${target.name}_${timestamp}.png`;
-
-// Screenshot ONLY the element
-await element.screenshot({ path: filePath });
-
-// Send to Discord (clean message)
+// Prepare Discord message
 const form = new FormData();
-form.append("content", `TIME: ${timestamp} UTC`);
+form.append("content", `✅ Screenshot at ${timestamp} UTC`);
 form.append("file", fs.createReadStream(filePath));
 
 await fetch(WEBHOOK_URL, {
 method: "POST",
-body: form,
+body: form
 });
 
-console.log(`✅ Sent ${target.name} at ${timestamp}`);
+console.log(`✅ Sent screenshot of ${url} at ${timestamp} UTC`);
 
 // Delete local file after sending
-fs.unlink(filePath, () => {});
+fs.unlinkSync(filePath);
+
 } catch (err) {
-console.error(`❌ Failed for ${target.name}:`, err.message);
+console.error(`❌ Error processing ${url}:`, err);
 }
 }
 
 await browser.close();
 }
 
-// ==============================
-// RUN + LOOP
-// ==============================
-
 // Run immediately
 takeScreenshotsAndSend();
 
 // Repeat every 6 minutes
-setInterval(takeScreenshotsAndSend, 6 * 60 * 1000);
+setInterval(takeScreenshotsAndSend, INTERVAL);
