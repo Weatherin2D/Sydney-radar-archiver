@@ -1,4 +1,5 @@
 const { chromium } = require("playwright");
+const browser = await chromium.launch({ headless: true });
 const fetch = (...args) =>
 import("node-fetch").then(({ default: fetch }) => fetch(...args));
 const fs = require("fs");
