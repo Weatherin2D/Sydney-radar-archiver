@@ -1,0 +1,1 @@
+- Once in creste a enviromental/secret variable called "WEBHOOK_URL" with a value of whatever webhook link you want for your server.
