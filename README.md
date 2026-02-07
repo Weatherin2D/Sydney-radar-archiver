@@ -1,1 +1,4 @@
-- Once in create an enviromental/secret variable called "WEBHOOK_URL" with a value of whatever webhook link you want for your server.
+Things needed:
+- Webhook Url
+- Website Adress
+- Discord bot (with token)
