@@ -1,4 +1,4 @@
 Things needed:
 - Webhook Url
-- Website Adress
+- Website Address
 - Discord bot (with token)
