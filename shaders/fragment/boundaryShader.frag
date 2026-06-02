@@ -104,17 +104,12 @@ void main()
 
     float precipCoalescence = max(-precipFeedback[VAPOR], 0.); // how much cloud water turns into rain
 
-    water[CLOUD] = max(water[CLOUD] - precipCoalescence, 0.0); // clamp to prevent negative
-
-    // Limit water removal to prevent unrealistic dew points (e.g., -100°C)
-    // Minimum water corresponds to dew point of -80°C
-    float minWaterForTemp = maxWater(max(realTemp - 80.0, CtoK(-80.0)));
-    water[TOTAL] = max(water[TOTAL] - precipCoalescence, minWaterForTemp);
+    water[CLOUD] -= precipCoalescence;
+    water[TOTAL] -= precipCoalescence;
 
     float precipEvaporation = max(precipFeedback[VAPOR], 0.);
 
     water[TOTAL] += precipEvaporation; // evaporating rain adds water vapor to air
-    water[TOTAL] = max(water[TOTAL], 0.0); // ensure water[TOTAL] stays non-negative after evaporation
 
 
     //  0.004 for rain visualisation
@@ -152,15 +147,6 @@ void main()
     gravityForce -= precipFeedback[MASS] * gravMult * waterWeight; // precipitation weigth added to gravity force
 
     base[VY] += gravityForce;
-
-    // Hydrostatic pressure tendency: warm air reduces pressure, cold air increases it.
-    // This is the real mechanism behind thermal lows and highs.
-    // Rate is very small to avoid disrupting the fluid solver, but persistent.
-    // Only apply near the surface where surface pressure is most relevant.
-    if (wall[VERT_DISTANCE] <= 3) {
-      float tempAnomaly = base[TEMPERATURE] - getInitialT(int(fragCoord.y));
-      base[PRESSURE] -= tempAnomaly * 0.000002; // warm = lower pressure, cold = higher pressure
-    }
 
     // base.x += sin(texCoord.x * PI * 2.0 + iterNum * 0.000005) * (1. - texCoord.y) * 0.00015; // phantom force to simulate high and low pressure areas
 
@@ -384,9 +370,6 @@ void main()
         break;
       }
     }
-
-    // Final clamp to ensure water[TOTAL] never goes negative
-    water[TOTAL] = max(water[TOTAL], 0.0);
   } else {                                                                 // this is wall
 
     wall[VERT_DISTANCE] = wallX0Yp[VERT_DISTANCE] - 1;                     // height below ground is counted

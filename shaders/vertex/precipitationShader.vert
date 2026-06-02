@@ -32,8 +32,6 @@ uniform float iterNum;          // used as seed for random function
 uniform float numDroplets;      // total number of droplets
 uniform float inactiveDroplets; // used to maintain constant spawnrate
 
-uniform float lightningFrequency;
-
 uniform float evapHeat;
 uniform float meltingHeat;
 
@@ -99,10 +97,10 @@ void main()
       //  treshHold = max(map_range(realTemp, CtoK(0.0), CtoK(-30.0), subZeroThreshold, initalMass), initalMass);
       threshold = subZeroThreshold;
 
-    if (water[CLOUD] > threshold && base[TEMPERATURE] < 500.) {                                                                     // if cloudwater above threshold and not wall
-                                                                                                                                    // float spawnChance = (water[1] - threshold) * 1000.0 / inactiveDroplets;
-                                                                                                                                    // if (spawnChance > rand2d(mass.xy)) {
-                                                                                                                                    //  float spawnChance = (water[CLOUD] - threshold) / inactiveDroplets * resolution.x * resolution.y * spawnChanceMult;
+    if (water[CLOUD] > threshold && base[TEMPERATURE] < 500.) { // if cloudwater above threshold and not wall
+                                                                // float spawnChance = (water[1] - threshold) * 1000.0 / inactiveDroplets;
+                                                                // if (spawnChance > rand2d(mass.xy)) {
+                                                                //  float spawnChance = (water[CLOUD] - threshold) / inactiveDroplets * resolution.x * resolution.y * spawnChanceMult;
 
       float spawnChance = ((water[CLOUD] - threshold) / (inactiveDroplets + 10.0)) * resolution.x * resolution.y * spawnChanceMult; // 20.0  50.0
 
@@ -123,15 +121,16 @@ void main()
           vec4 lightningData = texture(lightningDataTex, vec2(0.5)); // data from last lightning bolt
 
           const float lightningCloudDensityThreshold = 2.5;          // 3.0
-          float lightningChanceMultiplier = 0.0033 * lightningFrequency; // 0.0011
+          const float lightningChanceMultiplier = 0.0033;            // 0.0011
 
           float cloudPlusPrecipDensity = water[CLOUD] + water[PRECIPITATION];
 
           float lightningSpawnChance = max((cloudPlusPrecipDensity - lightningCloudDensityThreshold) * lightningChanceMultiplier, 0.);
 
-          float minIterationsSinceLastLightningBolt = max(5.0, 30.0 - lightningFrequency * 0.05);
+          const float minIterationsSinceLastLightningBolt = 30.; // 50.
 
-          if (lightningData[START_ITERNUM] < iterNum - minIterationsSinceLastLightningBolt && random2d(vec2(base[TEMPERATURE] * 0.2324, water[TOTAL] * 7.7)) < lightningSpawnChance) { // Spawn lightning
+          if (lightningData[START_ITERNUM] < iterNum - minIterationsSinceLastLightningBolt &&
+              random2d(vec2(base[TEMPERATURE] * 0.2324, water[TOTAL] * 7.7)) < lightningSpawnChance) { // Spawn lightning
             lightningSpawned = true;
             isActive = false;
             gl_PointSize = 1.0;
@@ -172,6 +171,8 @@ void main()
       realTemp = potentialToRealT(base[TEMPERATURE]); // in Kelvin
     }
 
+    float relativeHumidity = relativeHumd(realTemp, water[TOTAL]);
+
     float totalMass = newMass[WATER] + newMass[ICE];
 
     if (totalMass < 0.04) { // to small
@@ -196,33 +197,57 @@ void main()
       // float surfaceArea = sqrt(totalMass); // As if droplet is a circle (2D)
       float surfaceArea = pow(totalMass, 1. / 3.); // As if droplet is a sphere (3D)
 
-                                                   // float growthRate = clamp(map_range(realTemp, CtoK(0.0), CtoK(-30.0), growthRate0C, growthRate_30C), growthRate0C, growthRate_30C); // the colder it gets the faster ice forms
+      // float growthRate = clamp(map_range(realTemp, CtoK(0.0), CtoK(-30.0), growthRate0C, growthRate_30C), growthRate0C, growthRate_30C); // the colder it gets the faster ice forms
       float growthRate = max(map_range(realTemp, CtoK(0.0), CtoK(-30.0), growthRate0C, growthRate_30C), growthRate0C); // the colder it gets the faster ice forms
 
       // growthRate = 0.0;                                                                                                                  // for debug
 
-      float growth = water[CLOUD] * growthRate * surfaceArea;
+      float cloudGrowth = water[CLOUD] * growthRate * surfaceArea;
+      float accretionGrowth = 0.0;
 
-      // Hail growth enhancement:
-      if (realTemp < CtoK(0.0) && water[CLOUD] > 0.0 && density == 1.0) { // below freezing
-        growth += surfaceArea * water[PRECIPITATION] * 0.0030;            // rain freezing onto hail
+      cloudGrowth += max(relativeHumidity - 1.0, 0.) * max(-30.0 - KtoC(realTemp), 0.) * 0.0000; // increase growthrate below -30 C and above 100% relative humidity
+
+      // Mixed-phase hail-core zone (−8 to −32 °C)
+      float hailCoreZone = smoothstep(CtoK(-6.0), CtoK(-14.0), realTemp)
+                         * (1.0 - smoothstep(CtoK(-30.0), CtoK(-36.0), realTemp));
+      float updraft = max(base[VY], 0.0);
+
+      // Riming compacts snow/graupel toward hail density (no extra cloud depletion)
+      if (newMass[ICE] > 0.0 && realTemp < CtoK(0.0) && hailCoreZone > 0.0) {
+        float riming = water[CLOUD] * growthRate * surfaceArea * hailCoreZone;
+        newDensity = min(1.0, newDensity + riming * (0.04 + updraft * 0.18));
       }
 
-      feedback[VAPOR] -= growth * 1.0; // takes water from the air
+      // Dense hail accretes from the in-air precip field, not from cloud water
+      if (realTemp < CtoK(0.0) && newDensity >= 0.82) {
+        accretionGrowth += surfaceArea * water[PRECIPITATION] * mix(0.0030, 0.0055, hailCoreZone);
+      }
+
+      feedback[VAPOR] -= cloudGrowth; // only cloud water is removed from the air
 
 
       if (realTemp < CtoK(0.0)) { // below freezing
 
-        newMass[ICE] += growth;   // ice growth
-        feedback[HEAT] += growth * meltingHeat;
+        newMass[ICE] += cloudGrowth + accretionGrowth;
+        // Hail core: supercooled cloud; accretion recycles existing precip with no net heating
+        float cloudHeatFrac = (newDensity >= 0.82 && hailCoreZone > 0.2) ? 0.04 : 1.0;
+        feedback[HEAT] += cloudGrowth * meltingHeat * cloudHeatFrac;
 
         float freezing = min((CtoK(0.0) - realTemp) * freezingRate * surfaceArea, newMass[WATER]); // rain freezing
         newMass[WATER] -= freezing;
         newMass[ICE] += freezing;
-        feedback[HEAT] += freezing * meltingHeat;
+        feedback[HEAT] += freezing * meltingHeat * cloudHeatFrac * 0.25;
+
+        // Wet-growth shell: internal water→ice, no cloud draw or latent heat
+        if (newMass[ICE] > 0.0 && newMass[WATER] > 0.0 && realTemp < CtoK(-4.0) && newDensity < 0.95) {
+          float shellFreeze = min(freezingRate * surfaceArea * 0.25, newMass[WATER] * 0.08);
+          newMass[WATER] -= shellFreeze;
+          newMass[ICE] += shellFreeze;
+          newDensity = min(1.0, newDensity + shellFreeze / max(totalMass, 0.05) * 0.35);
+        }
 
       } else {                                                                                                    // above freezing
-        newMass[WATER] += growth;                                                                                 // water growth
+        newMass[WATER] += cloudGrowth;                                                                            // water growth
 
         float melting = min((realTemp - CtoK(0.0)) * meltingRate * surfaceArea /* / newDensity */, newMass[ICE]); // 0.0002 snow / hail melting
         newMass[ICE] -= melting;
@@ -257,7 +282,13 @@ void main()
       // Update position
       // move with air    * 2. because droplet position goes from -1. to 1
       newPos += base.xy / resolution * 2.;
-      newPos.y -= fallSpeed * newDensity * sqrt(totalMass / surfaceArea); // fall speed relative to air
+      float fallVel = fallSpeed * newDensity * sqrt(totalMass / max(surfaceArea, 0.02));
+      // Dense hail in updrafts: modest lofting so cores can persist without stacking feedback
+      if (newDensity >= 0.88 && newMass[ICE] > 0.2 && hailCoreZone > 0.3) {
+        float updraftLift = updraft / max(resolution.y, 1.0) * 2.0;
+        fallVel = max(fallVel - updraftLift * 0.45, fallVel * 0.25);
+      }
+      newPos.y -= fallVel; // fall speed relative to air
       /*
        // falling at fixed speed:
       float cellHeight = texelSize.y * 12000.0; // in meters
@@ -270,9 +301,7 @@ void main()
 
       newPos.x = mod(newPos.x + 1., 2.) - 1.; // wrap horizontal position around map edges
 
-      float sizeFactor = pow(totalMass, 1.0 / 3.0);
-      float massScore = totalMass * sizeFactor; // weight mass by droplet size
-      feedback[MASS] = massScore;
+      feedback[MASS] = totalMass;
 
     }               // update
 
