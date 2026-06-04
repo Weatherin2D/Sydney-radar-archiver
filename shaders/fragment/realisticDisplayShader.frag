@@ -45,6 +45,7 @@ uniform float cellHeight; // in meters
 
 uniform float dryLapse;
 uniform float sunAngle;
+uniform float sunAzimuth;
 
 uniform float minShadowLight;
 uniform float greenHueStartThreshold;
@@ -350,6 +351,20 @@ float cloudDiffuseFlashGlow(vec2 p, vec2 center, float seed, float prog, float s
   return clamp(core + mid + halo, 0.0, 1.0);
 }
 
+// Lightning visibility — strike charge from spawn cache + smooth display cloud opacity
+// (no live chargeTex sampling; per-texel charge caused hard pixelated bolt edges)
+float lightningVisMask(float originMag, float typeThreshold, bool isCG,
+                       bool isCloudFlash, float cloudOpacityGate) {
+  if (isCloudFlash)
+    return 1.0;
+  float strikeGate = isCG
+    ? smoothstep(typeThreshold * 0.05, typeThreshold * 0.25, originMag)
+    : smoothstep(typeThreshold * 0.04, typeThreshold * 0.30, originMag);
+  if (isCG)
+    return strikeGate;
+  return strikeGate * cloudOpacityGate;
+}
+
 // Scatter flash size — type 3 uses CPU flashSize; bolts scale with charge / type
 float boltScatterFlashSize(int ltType, float originMag, float flashMeta) {
   if (ltType == 3)
@@ -535,16 +550,16 @@ vec4 getAirColor(vec2 fragCoordIn)
   vec2 bndFragCoord = vec2(fragCoordIn.x, clamp(fragCoordIn.y, 0., resolution.y)); // bound y within range
   base = smoothBilerpWallVis(baseTex, wallTex, bndFragCoord);
   wall = texture(wallTex, bndFragCoord * texelSize);                               // texCoord
-  water = (smoothClouds > 0.5 || enhancedLooks > 0.5)
-    ? smoothBilerpWallVis(waterTex, wallTex, bndFragCoord)
-    : bilerpWallVis(waterTex, wallTex, bndFragCoord);
-  lightIntensity = texture(lightTex, bndFragCoord * texelSize)[0] / standardSunBrightness;
+  water = smoothBilerpWallVis(waterTex, wallTex, bndFragCoord);
+  vec2 tcAir = bndFragCoord * texelSize;
+  lightIntensity = smoothSunlightSample(lightTex, tcAir, texelSize) / standardSunBrightness;
 
   ivec4 wallX0Ym = texture(wallTex, texCoordX0Ym);
 
   float realTemp = potentialToRealT(base[TEMPERATURE]);
 
-  bool nightTime = abs(sunAngle) > 85.0 * deg2rad; // false = day time
+  bool nightTime = sunAngle > 1.72; // deep night (~8.5° below horizon)
+  float twilightFill = twilightUnderglowStrength(sunAngle);
 
   shadowLight = minShadowLight;
 
@@ -599,8 +614,8 @@ vec4 getAirColor(vec2 fragCoordIn)
       cloudCol = mix(grayCol, whiteCol, smoothstep(0.0, 1.0, localT));
     }
   } else {
-    // Original calculation
-    cloudCol = vec3(1.0 / (cloudwater * 0.005 + 1.0)); // 0.10 white to black
+    float smoothCw = smoothCloudWater(waterTex, tcAir, resolution);
+    cloudCol = vec3(1.0 / (smoothCw * 0.005 + 1.0));
   }
 
   float cloudOpacity;
@@ -619,8 +634,8 @@ vec4 getAirColor(vec2 fragCoordIn)
     cloudOpacity = clamp(1.0 - (1.0 / (1. + totalDensity)), 0.0, 1.0);
   }
 
-  const vec3 smokeThinCol = vec3(0.8, 0.51, 0.26);
-  const vec3 smokeThickCol = vec3(0., 0., 0.);
+  const vec3 smokeThinCol = vec3(0.914, 0.588, 0.478);  // #E9967A dark salmon
+  const vec3 smokeThickCol = vec3(0.55, 0.35, 0.28);     // darker salmon for dense smoke
 
 
   float smokeOpacity = clamp(1. - (1. / (water[SMOKE] + 1.)), 0.0, 1.0);
@@ -631,6 +646,39 @@ vec4 getAirColor(vec2 fragCoordIn)
   vec3 smokeOrFireCol = mix(mix(smokeThinCol, smokeThickCol, smokeOpacity), fireCol, fireIntensity);
 
   shadowLight += fireIntensity * 2.5;                                                                                 // 1.5
+
+  // Soft sun-facing shading (gradual highlight ↔ shadow, no hard blocks)
+  if (cloudOpacity > 0.01 && !nightTime) {
+    vec2 tc = tcAir;
+    vec2 sunPos = sunScreenPositionForLight(sunAngle, sunAzimuth);
+    vec2 toSun = sunPos - tc;
+    toSun.x *= texelSize.y / texelSize.x;
+    vec2 lDir = length(toSun) > 1e-5 ? normalize(toSun) : vec2(0.0, 1.0);
+
+    float gradStep = 2.25;
+    vec2 grad = vec2(
+      smoothCloudWater(waterTex, tc + vec2(texelSize.x * gradStep, 0.0), resolution) -
+        smoothCloudWater(waterTex, tc - vec2(texelSize.x * gradStep, 0.0), resolution),
+      smoothCloudWater(waterTex, tc + vec2(0.0, texelSize.y * gradStep), resolution) -
+        smoothCloudWater(waterTex, tc - vec2(0.0, texelSize.y * gradStep), resolution));
+    vec2 n = length(grad) > 1e-6 ? normalize(vec2(-grad.x, -grad.y)) : vec2(0.0, 1.0);
+    float facing = clamp(dot(n, lDir), -0.15, 1.0);
+    facing = smoothstep(-0.12, 0.88, facing);
+
+    vec2 pixRay = sunlightRayToSun(texelSize, tc, sunAngle, sunAzimuth);
+    float sunwardL = smoothSunlightSample(lightTex, tc + pixRay, texelSize) / standardSunBrightness;
+    float leewardL = smoothSunlightSample(lightTex, tc - pixRay, texelSize) / standardSunBrightness;
+    float scat = clamp(map_range(sunAngle, 1.38, 1.58, 0.0, 1.0), 0.0, 1.0);
+    float lightMix = mix(leewardL, sunwardL, 0.38 + 0.62 * facing);
+    lightMix = mix(lightMix, max(sunwardL, lightMix), twilightFill * 0.65);
+    float softLit = smoothstep(0.08, 0.72, lightMix) * smoothstep(-0.05, 0.35, facing);
+
+    vec3 gold = mix(vec3(1.0, 0.94, 0.82), vec3(1.0, 0.58, 0.14), scat);
+    vec3 shadowCol = cloudCol * mix(vec3(0.62, 0.66, 0.78), vec3(0.48, 0.42, 0.52), scat);
+    vec3 litCol = cloudCol * mix(vec3(1.0), gold, 0.25 + scat * 0.35);
+    litCol += gold * softLit * (0.12 + scat * 0.22) * cloudOpacity;
+    cloudCol = mix(shadowCol, litCol, softLit * (0.55 + twilightFill * 0.35) + twilightFill * 0.12);
+  }
 
   float opacity = 1. - (1. - smokeOpacity) * (1. - cloudOpacity) * (1. - fogMistOpacity);                     // alpha blending with fog/mist
   vec3 color;
@@ -672,16 +720,16 @@ void main()
   vec2 bndFragCoord = vec2(fragCoord.x, clamp(fragCoord.y, 0., resolution.y)); // bound y within range
   base = smoothBilerpWallVis(baseTex, wallTex, bndFragCoord);
   wall = texture(wallTex, bndFragCoord * texelSize);                           // texCoord
-  water = (smoothClouds > 0.5 || enhancedLooks > 0.5)
-    ? smoothBilerpWallVis(waterTex, wallTex, bndFragCoord)
-    : bilerpWallVis(waterTex, wallTex, bndFragCoord);
-  lightIntensity = texture(lightTex, bndFragCoord * texelSize)[0] / standardSunBrightness;
+  water = smoothBilerpWallVis(waterTex, wallTex, bndFragCoord);
+  vec2 tcAir = bndFragCoord * texelSize;
+  lightIntensity = smoothSunlightSample(lightTex, tcAir, texelSize) / standardSunBrightness;
 
   ivec4 wallX0Ym = texture(wallTex, texCoordX0Ym);
 
   float realTemp = potentialToRealT(base[TEMPERATURE]);
 
-  bool nightTime = abs(sunAngle) > 85.0 * deg2rad; // false = day time
+  bool nightTime = sunAngle > 1.72; // deep night (~8.5° below horizon)
+  float twilightFill = twilightUnderglowStrength(sunAngle);
 
   shadowLight = minShadowLight;
 
@@ -695,8 +743,8 @@ void main()
 
     color = getWallColor(depth);
 
-    lightIntensity = texture(lightTex, vec2(texCoord.x, texelSize.y))[0] / standardSunBrightness; // sample lowest part of sim area
-    lightIntensity *= pow(0.5, -fragCoord.y);                                                     // 0.5 should be same as in lightingshader deeper is darker
+    lightIntensity = smoothSunlightSample(lightTex, bndFragCoord * texelSize, texelSize) / standardSunBrightness;
+    lightIntensity = min(lightIntensity, 0.35);
 
   } else if (texCoord.y > 1.0) {                                                                  // above simulation area
     // color = vec3(0); // no need to set
@@ -743,6 +791,17 @@ void main()
 
       color = getWallColor(depth);
 
+      {
+        vec2 sunPos = sunScreenPosition(sunAngle, sunAzimuth);
+        vec2 toSun = sunPos - texCoord;
+        toSun.x *= texelSize.y / texelSize.x;
+        vec2 sunDir = length(toSun) > 1e-5 ? toSun / length(toSun) : vec2(0.0, 1.0);
+        if (wallXmY0[DISTANCE] == 0)
+          color *= 0.45 + 0.55 * smoothstep(0.0, 0.2, sunDir.x);
+        if (wallXpY0[DISTANCE] == 0)
+          color *= 0.45 + 0.55 * smoothstep(0.0, 0.2, -sunDir.x);
+      }
+
       break;
     case WALLTYPE_WATER:
 
@@ -778,7 +837,15 @@ void main()
         opacity = airColor.a;
         color = airColor.rgb;
       } else {
-        color = vec3(0, 0.5, 1.0); // water
+        float scatW = clamp(map_range(abs(sunAngle), 75.0 * deg2rad, 90.0 * deg2rad, 0.0, 1.0), 0.0, 1.0);
+        color = mix(vec3(0.0, 0.12, 0.38), vec3(0.08, 0.22, 0.42), 1.0 - scatW * 0.35);
+        if (scatW > 0.15) {
+          vec2 sunPosW = sunScreenPosition(sunAngle, sunAzimuth);
+          float horizDist = abs(texCoord.x - sunPosW.x) * aspectRatios.x;
+          float glint = 0.88 + 0.12 * sin(texCoord.x * 31.0 + texCoord.y * 19.0 + iterNum * 0.02);
+          float sunPath = exp(-horizDist * horizDist * 28.0) * exp(-max(texCoord.y, 0.0) * 2.0) * scatW * glint * 0.22;
+          color += vec3(1.0, 0.55, 0.18) * sunPath;
+        }
       }
 
       // draw 45° slopes under water
@@ -792,6 +859,11 @@ void main()
           water = texture(waterTex, texCoord);
           color = getWallColor(float(-wall[VERT_DISTANCE]) - localY);
           shadowLight = minShadowLight;
+          vec2 sunPos = sunScreenPosition(sunAngle, sunAzimuth);
+          vec2 toSun = sunPos - texCoord;
+          toSun.x *= texelSize.y / texelSize.x;
+          vec2 sunDir = length(toSun) > 1e-5 ? toSun / length(toSun) : vec2(0.0, 1.0);
+          color *= 0.45 + 0.55 * smoothstep(0.0, 0.2, sunDir.x);
         }
       }
       if (wallXpY0[DISTANCE] == 0 && wallXpY0[TYPE] != WALLTYPE_WATER && (fragCoord.y < 1. || wallX0Ym[TYPE] != WALLTYPE_WATER)) { // wall to the right and below
@@ -800,6 +872,11 @@ void main()
           water = texture(waterTex, texCoord);
           color = getWallColor(float(-wall[VERT_DISTANCE]) - localY);
           shadowLight = minShadowLight;
+          vec2 sunPos = sunScreenPosition(sunAngle, sunAzimuth);
+          vec2 toSun = sunPos - texCoord;
+          toSun.x *= texelSize.y / texelSize.x;
+          vec2 sunDir = length(toSun) > 1e-5 ? toSun / length(toSun) : vec2(0.0, 1.0);
+          color *= 0.45 + 0.55 * smoothstep(0.0, 0.2, -sunDir.x);
         }
       }
 
@@ -864,7 +941,11 @@ void main()
           float scatterReach = resolution.x * (0.06 + scatterSize * 0.14);
           float strikeReach = isCloudFlash ? scatterReach : max(boltReach, scatterReach);
           float distOrigin  = length(fragCoord - bOrigin);
-          if (distOrigin <= strikeReach) {
+          float cloudOpacityGate = isCG ? 1.0
+            : smoothstep(typeThreshold * 0.10, typeThreshold * 1.40, opacity);
+          float visMask     = lightningVisMask(originMag, typeThreshold, isCG,
+                                               isCloudFlash, cloudOpacityGate);
+          if (distOrigin <= strikeReach && visMask > 0.003) {
             float reachFade = 1.0 - smoothstep(strikeReach * 0.78, strikeReach, distOrigin);
 
             float crawlThick = resolution.x * 0.000068 * widthScale;
@@ -874,8 +955,7 @@ void main()
                             : (isStrobe ? strobeLightningIntensity : cloudLightningIntensity));
             // Mild charge boost for flash/bolt brightness (capped)
             float chargeFlash = 1.0 + min(originMag * 0.28, 0.22);
-            float cloudClip  = isCG ? 1.0
-              : smoothstep(typeThreshold * 0.30, typeThreshold * 1.15, opacity);
+            float cloudClip  = cloudOpacityGate;
 
             for (int f = 0; f < 2; f++) {
               if (f >= numFlashes) break;
@@ -894,7 +974,7 @@ void main()
                 boltProg = clamp(1.0 - pow(1.0 - boltProg, 2.2), 0.0, 1.0);
               float riseFade = smoothstep(0.0, growFrames, fAge);
               float flick = 0.88 + 0.12 * rand(iterNum * 1.9 + seed + float(f) * 131.0);
-              float envFade = riseFade * repFade * globalFade * flick * reachFade;
+              float envFade = riseFade * repFade * globalFade * flick * reachFade * visMask;
 
               // Cloud flash: gentle swell; strobe/crawler keep sharper pulse
               if (isStrobe || isCrawler) {
@@ -939,7 +1019,7 @@ void main()
 
               // Bolts — cloud flash (type 3) has no core bolt
               if (tG > 0.003 && cloudClip > 0.01 && ltType != 3) {
-                float bright = intensity * 1.08 * flick * envFade * chargeFlash * cloudClip;
+                float bright = intensity * 1.08 * flick * envFade * chargeFlash;
                 vec3 col = boltColorForType(ltType, tG, bOrigin, fragCoord) * bright * tG;
                 emittedLight += col;
                 onLight      += col * 0.52;
@@ -1184,14 +1264,21 @@ void main()
   }
 
 
-  float scatering = clamp(map_range(abs(sunAngle), 75. * deg2rad, 90. * deg2rad, 0., 1.), 0., 1.); // how red the sunlight is
+  float scatering = clamp(map_range(sunAngle, 1.38, 1.58, 0., 1.), 0., 1.); // how red the sunlight is
 
-  // Enhanced looks: darker shadows by reducing light intensity more in shadow areas
-  float adjustedLightIntensity = lightIntensity;
+  // Sample light from direction toward sun at this pixel (radial, not parallel)
+  vec2 tcMain = bndFragCoord * texelSize;
+  vec2 pixRayToSun = sunlightRayToSun(texelSize, tcMain, sunAngle, sunAzimuth);
+  float sunwardLight = smoothSunlightSample(lightTex, tcMain + pixRayToSun, texelSize) / standardSunBrightness;
+  float leewardLight = smoothSunlightSample(lightTex, tcMain - pixRayToSun, texelSize) / standardSunBrightness;
+  float lightBlend = smoothstep(0.0, 0.35, sunwardLight - leewardLight);
+  float adjustedLightIntensity = mix(lightIntensity, max(sunwardLight, lightIntensity), 0.35 + 0.65 * lightBlend);
+  adjustedLightIntensity = mix(adjustedLightIntensity, max(sunwardLight, leewardLight * 0.85), lightBlend * 0.45);
+  adjustedLightIntensity += twilightFill * 0.22 * (0.35 + sunwardLight * 0.65);
+  adjustedLightIntensity *= mix(1.0, 0.92 + lightBlend * 0.08, 1.0 - twilightFill * 0.35);
+
   if (enhancedLooks > 0.5) {
-    // When in shadow (low light intensity), make it even darker for dramatic effect
-    // Use smooth curve to darken shadows while preserving highlights
-    adjustedLightIntensity = pow(lightIntensity, 1.5) * 0.85 + lightIntensity * 0.15;
+    adjustedLightIntensity = pow(adjustedLightIntensity, 1.5) * 0.85 + adjustedLightIntensity * 0.15;
   }
 
   vec3 finalLight = sunColor(scatering) * adjustedLightIntensity;

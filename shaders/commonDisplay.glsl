@@ -8,41 +8,6 @@ const vec3 ONE_OVER_GAMMA = vec3(1. / GAMMA);
 const vec3 tempColorPalette[] = vec3[](vec3(1., 0.7, 1.), vec3(1., 0.5, 1.), vec3(1., 0.3, 1.), vec3(0.8, 0., 0.8), vec3(0.65, 0., 0.6), vec3(0.5, 0., 0.5), vec3(0.35, 0., 0.6), vec3(0., 0., 0.7), vec3(0., 0., 1.), vec3(0., 0.30, 1.), vec3(0., 0.44, 1.), vec3(0., 0.62, 1.0), vec3(0., 0.80, 1.0), vec3(0., 1., 1.), vec3(0., 0.50, 0.), vec3(0., 0.61, 0.0), vec3(0., 0.72, 0.), vec3(0., 0.85, 0.),
                                        vec3(0., 1., 0.), vec3(0.5, 1., 0.), vec3(0.80, 1., 0.), vec3(1., 1., 0.), vec3(1., 0.8, 0.), vec3(1., 0.6, 0.), vec3(1., 0.4, 0.), vec3(1., 0., 0.), vec3(0.85, 0., 0.), vec3(0.72, 0., 0.), vec3(0.61, 0., 0.), vec3(0.52, 0., 0.));
 
-// Relative humidity: smooth 0%→99%, dark blue at 99%, hard white at 100%.
-const vec3 rhColorStops[] = vec3[](
-  vec3(1.0, 0.0, 0.0),
-  vec3(1.0, 0.55, 0.0),
-  vec3(1.0, 1.0, 0.0),
-  vec3(0.0, 0.85, 0.0),
-  vec3(0.0, 0.95, 0.75),
-  vec3(0.0, 0.65, 1.0),
-  vec3(0.0, 0.0, 0.55)
-);
-const int RH_COLOR_STOPS = 7;
-const vec3 RH_DARK_BLUE = vec3(0.0, 0.0, 0.55);
-
-vec3 sampleRhColor(float relativeHumidity)
-{
-  float t = clamp(relativeHumidity, 0.0, 1.0);
-  if (t >= 1.0)
-    return vec3(1.0);
-  if (t >= 0.99)
-    return RH_DARK_BLUE;
-  float u = t / 0.99;
-  float pos = u * float(RH_COLOR_STOPS - 1);
-  int i0 = clamp(int(floor(pos)), 0, RH_COLOR_STOPS - 2);
-  int i1 = i0 + 1;
-  return mix(rhColorStops[i0], rhColorStops[i1], fract(pos));
-}
-
-// Saturated air: cloud density as white (thin) -> dark gray (dense).
-vec3 sampleRhCloudColor(float cloudDens)
-{
-  float t = clamp(cloudDens / 10.0, 0.0, 1.0);
-  return vec3(1.0 - t * 0.92);
-}
-
-
 // functions for display shaders
 void drawCursor(vec4 cursor, vec3 view)            // OFF: cursor.w < 1       Normal round: cursor.w 1 to 2         WHOLE WIDTH: cursor.w >= 2
 {
@@ -297,4 +262,39 @@ vec4 smoothBilerpWallVis(sampler2D tex, isampler2D wallTex, vec2 pos)
   }
 
   return mix(mix(a, b, mixAB), mix(c, d, mixCD), mixAB_CD);
+}
+
+// Hermite-interpolated cloud water (smooth density for lighting normals)
+float smoothCloudWater(sampler2D waterTex, vec2 tc, vec2 resolution)
+{
+  vec2 st = tc * resolution - vec2(0.5);
+  vec2 ipos = floor(st);
+  vec2 fpos = fract(st);
+  vec2 sf = fpos * fpos * (3.0 - 2.0 * fpos);
+  vec2 uvA = (ipos + vec2(0.5, 0.5)) / resolution;
+  vec2 uvB = (ipos + vec2(1.5, 0.5)) / resolution;
+  vec2 uvC = (ipos + vec2(0.5, 1.5)) / resolution;
+  vec2 uvD = (ipos + vec2(1.5, 1.5)) / resolution;
+  float a = texture(waterTex, uvA)[1];
+  float b = texture(waterTex, uvB)[1];
+  float c = texture(waterTex, uvC)[1];
+  float d = texture(waterTex, uvD)[1];
+  return mix(mix(a, b, sf.x), mix(c, d, sf.x), sf.y);
+}
+
+// Soft sunlight sample (reduces blocky shadow boundaries from the light grid)
+float smoothSunlightSample(sampler2D lightTex, vec2 tc, vec2 texelSize)
+{
+  float sum = 0.0;
+  float wsum = 0.0;
+  for (int j = -2; j <= 2; j++) {
+    for (int i = -2; i <= 2; i++) {
+      vec2 o = vec2(float(i), float(j)) * texelSize * 0.85;
+      float d = length(vec2(float(i), float(j)));
+      float w = exp(-d * d * 0.55);
+      sum += texture(lightTex, tc + o)[0] * w;
+      wsum += w;
+    }
+  }
+  return sum / wsum;
 }
